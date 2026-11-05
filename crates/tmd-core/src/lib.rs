@@ -18,7 +18,7 @@ mod theme_file;
 mod width;
 mod wrap;
 
-pub use document::{CodeSnippet, Document};
+pub use document::{CodeSnippet, Document, Heading};
 pub use line::{Line, LineSize, Span};
 pub use streamer::{Frame, Streamer};
 pub use style::{Color, Style};

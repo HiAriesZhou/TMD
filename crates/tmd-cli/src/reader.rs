@@ -13,6 +13,7 @@ use tmd_core::{Document, Line, LineSize, RenderOptions, Theme, truncate};
 use crate::cli::{Cli, InputFormat, ReaderMode};
 use crate::clipboard::{self, CopyError};
 use crate::reader_copy::CodePicker;
+use crate::reader_outline::Outline;
 use crate::reader_search::Search;
 use crate::terminal_io::{RESET, direct_kaku, write_all_cancelled};
 use crate::{ansi, large_headings, reader_native};
@@ -77,16 +78,14 @@ fn visible_end(lines: &[Line], start: usize, height: usize) -> usize {
 }
 
 fn last_start(lines: &[Line], height: usize) -> usize {
-    if height == 0 {
-        return 0;
-    }
     let mut start = lines.len();
     let mut used = 0;
     while start > 0 && used + lines[start - 1].physical_height() <= height {
         start -= 1;
         used += lines[start].physical_height();
     }
-    start
+    // When no row fits, retain a valid logical anchor for the next resize.
+    start.min(lines.len().saturating_sub(1))
 }
 
 fn paint(
@@ -148,7 +147,9 @@ fn paint(
         } else {
             "阅读中"
         };
-        format!("{position}{notice} · / 搜索 · c 复制 · ? 帮助 · q/Esc 返回 · 滚轮/↑↓ · Home/End")
+        format!(
+            "{position}{notice} · / 搜索 · o 目录 · c 复制 · ? 帮助 · q/Esc 返回 · 滚轮/↑↓ · Home/End"
+        )
     };
     if rows > 0 {
         out.push_str(&format!(
@@ -175,6 +176,7 @@ enum Action {
     Next,
     Previous,
     Copy,
+    Outline,
     Confirm,
 }
 
@@ -199,6 +201,7 @@ fn key_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('/') => Action::Search,
         KeyCode::Char('c') => Action::Copy,
+        KeyCode::Char('o') => Action::Outline,
         KeyCode::Enter => Action::Confirm,
         KeyCode::Char('n') => Action::Next,
         KeyCode::Char('N') => Action::Previous,
@@ -226,6 +229,7 @@ fn help_lines(width: u16) -> Vec<Line> {
         "/：搜索正文（区分大小写，Enter 确认）",
         "n / N：下一处 / 上一处匹配",
         "c：选择代码块，Enter 复制内容，Esc 取消",
+        "o：打开标题目录，Enter 跳转，Esc 取消",
         "搜索中 Esc：取消；Ctrl-U：清空查询",
         "q / Esc：关闭帮助；阅读时返回命令行",
         "Ctrl-C：中断并返回命令行",
@@ -412,6 +416,7 @@ fn run_with_copy(
         let mut help_start = 0;
         let mut search = Search::default();
         let mut picker = CodePicker::default();
+        let mut outline = Outline::default();
         loop {
             if session.cancelled.load(Ordering::SeqCst) != 0 {
                 break;
@@ -425,7 +430,18 @@ fn run_with_copy(
             } else {
                 Vec::new()
             };
-            let (view, position, heading) = if picker.open {
+            let outline_rows = if outline.open {
+                outline.rows(document.headings(), size.0)
+            } else {
+                Vec::new()
+            };
+            let (view, position, heading) = if outline.open {
+                (
+                    &outline_rows,
+                    outline.top(size.1.saturating_sub(2) as usize),
+                    "tmd · 标题目录（Enter 跳转，q/Esc 返回）",
+                )
+            } else if picker.open {
                 (
                     &code_rows,
                     picker.top(size.1.saturating_sub(2) as usize),
@@ -436,14 +452,22 @@ fn run_with_copy(
             } else {
                 (&lines, start, title.as_str())
             };
-            let highlight = if picker.open {
+            let highlight = if outline.open {
+                Some(outline.selected)
+            } else if picker.open {
                 Some(picker.selected)
             } else if !help && search.input.is_none() {
                 search.current().and_then(|m| Document::match_line(view, m))
             } else {
                 None
             };
-            let combined_notice = if picker.open {
+            let combined_notice = if outline.open {
+                format!(
+                    " · {}/{} · Enter 跳转 · Esc 取消",
+                    outline.selected + 1,
+                    document.headings().len()
+                )
+            } else if picker.open {
                 format!(
                     " · {}/{} · Enter 复制 · Esc 取消{}",
                     picker.selected + 1,
@@ -451,7 +475,12 @@ fn run_with_copy(
                     picker.notice
                 )
             } else {
-                format!("{}{notice}{}", picker.notice, search.notice())
+                format!(
+                    "{}{}{notice}{}",
+                    outline.notice,
+                    picker.notice,
+                    search.notice()
+                )
             };
             let (mut frame, end) =
                 paint(view, position, size, heading, &combined_notice, highlight);
@@ -506,6 +535,45 @@ fn run_with_copy(
             {
                 session.cancelled.store(2, Ordering::SeqCst);
                 break;
+            }
+            if outline.open {
+                let count = document.headings().len();
+                match &input {
+                    Event::Key(key) => match key_action(*key) {
+                        Some(Action::Exit) => outline.open = false,
+                        Some(Action::Confirm) => {
+                            if let Some(row) = document
+                                .headings()
+                                .get(outline.selected)
+                                .and_then(|heading| Document::heading_line(&lines, heading))
+                            {
+                                start =
+                                    row.min(last_start(&lines, size.1.saturating_sub(2) as usize));
+                                outline.open = false;
+                            }
+                        }
+                        Some(Action::Up) => outline.move_by(-1, count),
+                        Some(Action::Down) => outline.move_by(1, count),
+                        Some(Action::Top) => outline.selected = 0,
+                        Some(Action::Bottom) => outline.move_by(isize::MAX, count),
+                        Some(Action::PageUp) => {
+                            outline.move_by(-(size.1.saturating_sub(2).max(1) as isize), count)
+                        }
+                        Some(Action::PageDown) => {
+                            outline.move_by(size.1.saturating_sub(2).max(1) as isize, count)
+                        }
+                        _ => {}
+                    },
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => outline.move_by(-3, count),
+                        MouseEventKind::ScrollDown => outline.move_by(3, count),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                if !matches!(input, Event::Resize(..)) {
+                    continue;
+                }
             }
             if picker.open {
                 match &input {
@@ -579,7 +647,13 @@ fn run_with_copy(
                     Some(Action::Copy) if !help => {
                         picker.show(document.code_blocks(), &lines[start..]);
                     }
-                    Some(Action::Copy | Action::Confirm) => continue,
+                    Some(Action::Outline) if !help => {
+                        outline.show(
+                            document.headings(),
+                            lines.get(start).map_or(0, |line| line.src.start),
+                        );
+                    }
+                    Some(Action::Copy | Action::Outline | Action::Confirm) => continue,
                     Some(Action::Next | Action::Previous) if !help => {
                         search.advance(key.code == KeyCode::Char('N'));
                         if let Some(row) = search
@@ -718,6 +792,17 @@ mod tests {
         assert_eq!(frame.matches("\x1b#4").count(), 1);
         assert!(!frame.contains("?1049"));
         assert!(!frame.contains("\x1b[3J"));
+    }
+    #[test]
+    fn empty_viewport_keeps_a_valid_last_logical_anchor() {
+        let lines = [
+            row(LineSize::Normal),
+            row(LineSize::Double),
+            row(LineSize::Normal),
+        ];
+        assert_eq!(last_start(&lines, 0), 2);
+        assert_eq!(last_start(&[row(LineSize::Double)], 1), 0);
+        assert_eq!(last_start(&[], 0), 0);
     }
     #[test]
     fn resize_can_show_a_tiny_window_without_leaking_body_rows() {

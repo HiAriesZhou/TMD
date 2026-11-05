@@ -365,6 +365,100 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(t.finish(b"q"), 0)
         self.assert_restored(t)
 
+    def test_outline_lists_top_level_headings_and_jumps_to_duplicate(self):
+        paragraphs = lambda prefix: "\n\n".join(f"{prefix} {i:02}" for i in range(30))
+        text = ("# Same\n\n" + paragraphs("Before") +
+                "\n\n> # quote-example\n\n- # list-example\n\n```md\n# fenced-example\n```\n\n" +
+                "# Same\n\n" + paragraphs("After") + "\n\nSetext\n------\n\n" + paragraphs("Tail"))
+        t = self.terminal(text=text)
+        self.assertIn(b"Before 00", t.until(END))
+        menu = t.frame(b"o")
+        self.assertIn("标题目录".encode(), menu)
+        self.assertIn(b"1/3", menu)
+        self.assertEqual(menu.count(b"H1 Same"), 2)
+        self.assertIn(b"H2 Setext", menu)
+        for excluded in (b"quote-example", b"list-example", b"fenced-example"):
+            self.assertNotIn(excluded, menu)
+        t.frame(b"\x1b[B")
+        jumped = t.frame(b"\r")
+        self.assertIn(b"After 00", jumped)
+        self.assertNotIn(b"Before 00", jumped)
+        self.assertIn(b"2/3", t.frame(b"o"))
+        self.assertIn("标题目录".encode(), t.frame(b"\x1b[200~\rqo\x1b[201~"))
+        self.assertIn(b"After 00", t.frame(b"q"))
+        self.assertEqual(t.finish(b"q"), 0)
+        self.assert_restored(t)
+
+    def test_outline_resize_cancel_preserves_search_and_large_heading(self):
+        text = "# Top\n\n" + "\n\n".join(f"Before {i:02}" for i in range(30))
+        text += "\n\n# Target 中文\n\n" + "\n\n".join(f"After {i:02}" for i in range(30))
+        t = self.terminal(("--large-headings",), text=text)
+        t.until(END)
+        t.frame(b"/")
+        # One paste event avoids mistaking a partial per-key frame for the
+        # completed query when the PTY batches several printable keys.
+        t.frame(b"\x1b[200~Target\x1b[201~")
+        self.assertIn("匹配 1/1".encode(), t.frame(b"\r"))
+        t.frame(b"o")
+        t.frame(b"\x1b[H")
+        offset = len(t.data)
+        t.resize(20, 8)
+        t.until(END, offset)
+        returned = t.frame(b"\x1b")
+        self.assertIn(b"Target", returned)
+        self.assertEqual(returned.count(b"\x1b#3"), returned.count(b"\x1b#4"))
+        offset = len(t.data)
+        t.resize(80, 24)
+        self.assertIn("匹配 1/1".encode(), t.until(END, offset))
+        self.assertIn(b"2/2", t.frame(b"o"))
+        self.assertIn(b"After 00", t.frame(b"\r"))
+        self.assertEqual(t.finish(b"\x03"), 130)
+        self.assert_restored(t)
+
+    def test_outline_no_headings_and_tiny_window_interrupt(self):
+        t = self.terminal(text="plain document")
+        t.until(END)
+        self.assertIn("未找到顶层标题".encode(), t.frame(b"o"))
+        self.assertEqual(t.finish(b"q"), 0)
+        self.assert_restored(t)
+        t = self.terminal(text="# Heading\n\nbody")
+        t.until(END)
+        t.frame(b"o")
+        offset = len(t.data)
+        t.resize(4, 1)
+        t.until(END, offset)
+        self.assertEqual(t.finish(b"\x03"), 130)
+        self.assert_restored(t)
+
+    def test_outline_confirm_before_or_during_tiny_window_keeps_target(self):
+        text = "# First\n\n" + "\n\n".join(f"Before {i:02}" for i in range(30))
+        text += "\n\n# Target\n\n" + "\n\n".join(f"After {i:02}" for i in range(30))
+        for confirm_while_tiny in (True, False):
+            with self.subTest(confirm_while_tiny=confirm_while_tiny):
+                t = Terminal(("--large-headings",), text=text)
+                try:
+                    self.assertIn(b"Before 00", t.until(END))
+                    t.frame(b"o")
+                    t.frame(b"\x1b[B")
+                    if not confirm_while_tiny:
+                        self.assertIn(b"After 00", t.frame(b"\r"))
+                    offset = len(t.data)
+                    t.resize(4, 1)
+                    t.until(END, offset)
+                    if confirm_while_tiny:
+                        t.frame(b"\r")
+                    offset = len(t.data)
+                    t.resize(80, 24)
+                    returned = t.until(END, offset)
+                    self.assertIn(b"Target", returned)
+                    self.assertIn(b"After 00", returned)
+                    self.assertNotIn(b"Before 00", returned)
+                    self.assertEqual(returned.count(b"\x1b#3"), returned.count(b"\x1b#4"))
+                    self.assertEqual(t.finish(b"q"), 0)
+                    self.assert_restored(t)
+                finally:
+                    t.close()
+
     def test_cli_override_and_invalid_config(self):
         t = self.terminal(("--reader", "inline"), config="[reader]\nmode='native'")
         first = t.until(END)

@@ -8,6 +8,7 @@ mod reader;
 mod reader_config;
 mod reader_copy;
 mod reader_native;
+mod reader_outline;
 mod reader_search;
 #[cfg(test)]
 mod snapshots;

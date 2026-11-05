@@ -11,6 +11,7 @@ pub struct Document {
     text: String,
     theme: Theme,
     code_blocks: Vec<CodeSnippet>,
+    headings: Vec<Heading>,
 }
 
 impl Document {
@@ -21,11 +22,29 @@ impl Document {
             index_block(&mut block.block, &mut text);
         }
         let newline_offsets: Vec<usize> = markdown.match_indices('\n').map(|(i, _)| i).collect();
+        let headings = blocks
+            .iter()
+            .filter_map(|top| match &top.block {
+                Block::Heading { level, spans } => {
+                    let title: String = spans.iter().map(|span| span.text.as_str()).collect();
+                    Some(Heading {
+                        level: *level,
+                        title: title.split_whitespace().collect::<Vec<_>>().join(" "),
+                        source_line: newline_offsets
+                            .partition_point(|&offset| offset < top.src.start)
+                            + 1,
+                        source: top.src.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
         let mut code_blocks = Vec::new();
         for block in &mut blocks {
             collect_codes(&mut block.block, &newline_offsets, &mut code_blocks);
         }
         Self {
+            headings,
             code_blocks,
             blocks,
             text,
@@ -35,6 +54,23 @@ impl Document {
 
     pub fn code_blocks(&self) -> &[CodeSnippet] {
         &self.code_blocks
+    }
+
+    /// Top-level ATX/Setext headings in source order, including duplicates.
+    pub fn headings(&self) -> &[Heading] {
+        &self.headings
+    }
+
+    /// A top-level heading's first layout row, excluding its separating blank.
+    /// Exact source ranges also locate empty titles and repeated heading text.
+    pub fn heading_line(lines: &[Line], heading: &Heading) -> Option<usize> {
+        let first = lines.iter().position(|line| line.src == heading.source)?;
+        let separator = first > 0
+            && lines[first].spans.is_empty()
+            && lines
+                .get(first + 1)
+                .is_some_and(|line| line.src == heading.source);
+        Some(first + usize::from(separator))
     }
 
     pub fn layout(&self, width: u16, options: RenderOptions) -> Vec<Line> {
@@ -63,6 +99,15 @@ impl Document {
             })
         })
     }
+}
+
+/// A document heading, independent of display wrapping or terminal size.
+#[derive(Debug)]
+pub struct Heading {
+    pub level: u8,
+    pub title: String,
+    pub source_line: usize,
+    pub source: Range<usize>,
 }
 
 /// A parser-recognized code block, independent of terminal display wrapping.
@@ -151,6 +196,79 @@ fn index_block(block: &mut Block, text: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_keeps_top_level_atx_setext_and_duplicate_semantic_titles() {
+        let md = "# **Top** [label](https://example.test)\n\nSetext\n------\n\n### Same\n\n### Same\n\n####\n\n##### Fifth\n\n###### Sixth\n\n> # quoted example\n\n- # list example\n\n```md\n# fenced example\n```\n";
+        let doc = Document::new(md, Theme::default());
+        let headings = doc.headings();
+        assert_eq!(
+            headings.iter().map(|h| h.level).collect::<Vec<_>>(),
+            [1, 2, 3, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            headings
+                .iter()
+                .map(|h| h.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Top label", "Setext", "Same", "Same", "", "Fifth", "Sixth"]
+        );
+        assert_eq!(headings[0].source_line, 1);
+        assert_eq!(headings[1].source_line, 3);
+        assert_eq!(headings[2].source_line, 6);
+        assert_ne!(headings[2].source, headings[3].source);
+        assert!(doc.find("quoted example").len() == 1);
+    }
+
+    #[test]
+    fn outline_jumps_skip_separators_and_survive_reflow_and_large_headings() {
+        let md = "intro\n\n# Same\n\nbody\n\n# Same\n\n###\n\nlast";
+        let doc = Document::new(md, Theme::default());
+        let normal = doc.layout(80, RenderOptions::default());
+        assert_eq!(
+            doc.headings()
+                .iter()
+                .map(|h| Document::heading_line(&normal, h).unwrap())
+                .collect::<Vec<_>>(),
+            [2, 7, 10]
+        );
+        for width in [1, 4, 12, 80] {
+            for large in [false, true] {
+                let lines = doc.layout(
+                    width,
+                    RenderOptions {
+                        large_headings: large,
+                    },
+                );
+                let mut previous = 0;
+                for heading in doc.headings() {
+                    let row = Document::heading_line(&lines, heading).unwrap();
+                    assert!(row > previous);
+                    assert_eq!(lines[row].src, heading.source);
+                    assert!(lines[row - 1].spans.is_empty());
+                    assert!(lines[row].width() <= width as usize);
+                    previous = row;
+                }
+            }
+        }
+        let doc = Document::new("###\n", Theme::default());
+        assert_eq!(
+            Document::heading_line(
+                &doc.layout(80, RenderOptions::default()),
+                &doc.headings()[0]
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn outline_titles_are_single_line_and_no_headings_is_valid() {
+        let doc = Document::new("First<br>second\n==========\n", Theme::default());
+        assert_eq!(doc.headings()[0].title, "First second");
+        let doc = Document::new("plain\n\n> # nested\n", Theme::default());
+        assert!(doc.headings().is_empty());
+    }
+
     #[test]
     fn code_content_preserves_tabs_spaces_newlines_and_normalizes_crlf() {
         let md = "```text\r\n\t中文  \r\n\r\nlast\r\n```\r\n\n    indented\n      extra  \n\n> ```sh\n> echo 中文\n> ```\n\n- item\n\n  ```rs\n  let x = 1;\n  ```\n\n```\nunclosed";
